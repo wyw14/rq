@@ -515,6 +515,64 @@ class Queue:
 
         return self.connection.lrem(self.key, 1, job_id)
 
+    def transfer_jobs(
+        self,
+        job_ids: Iterable[Job | str],
+        destination: Queue | str,
+    ) -> dict[str, str]:
+        """Move waiting jobs from this queue to `destination` in a single
+        atomic operation.
+
+        Only jobs that still exist and are still waiting in this queue are
+        moved. They keep their source-relative order and are appended behind
+        the destination's existing jobs (whose order is unchanged); each moved
+        job's `origin` is updated to the destination. Jobs already taken by a
+        worker are never put back, and a job can never remain in both queues.
+
+        Args:
+            job_ids: Job IDs (or Job instances) to transfer.
+            destination: The destination queue, or its name.
+
+        Raises: ValueError if the destination is the same queue or uses a
+            different Redis connection.
+
+        Returns:
+            Per-job result keyed by job ID:
+                `moved`        - job was moved to the destination,
+                `no_such_job`  - no job with that ID exists (unknown job),
+                `not_in_queue` - job exists but is no longer in this queue
+                                 (taken by a worker, canceled, elsewhere).
+        """
+        from .scripts import transfer_jobs as _transfer_jobs
+
+        if isinstance(destination, str):
+            destination = self.__class__(
+                destination,
+                connection=self.connection,
+                job_class=self.job_class,
+                serializer=self.serializer,
+                death_penalty_class=self.death_penalty_class,
+            )
+        if destination.connection is not self.connection:
+            raise ValueError('Source and destination queues must use the same Redis connection')
+        if destination.key == self.key:
+            raise ValueError('Cannot transfer jobs to the queue they already belong to')
+
+        ids: list[str] = [
+            cast(str, job_or_id.id if isinstance(job_or_id, self.job_class) else job_or_id)
+            for job_or_id in job_ids
+        ]
+
+        statuses = _transfer_jobs(
+            self.connection,
+            source_key=self.key,
+            destination_key=destination.key,
+            job_key_prefix=self.job_class.redis_job_namespace_prefix,
+            destination_name=destination.name,
+            job_ids=ids,
+        )
+        return dict(zip(ids, statuses))
+
     def compact(self):
         """Removes all "dead" jobs from the queue by cycling through it,
         while guaranteeing FIFO semantics.

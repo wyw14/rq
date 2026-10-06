@@ -6,8 +6,14 @@ from typing import Any, Literal
 
 from .exceptions import DuplicateJobError
 from .logutils import blue, green
+from .utils import as_text
 
 logger = logging.getLogger('rq.scripts')
+
+# Per-job outcomes of a queue-to-queue transfer.
+JOB_TRANSFER_MOVED = 'moved'
+JOB_TRANSFER_NO_SUCH_JOB = 'no_such_job'
+JOB_TRANSFER_NOT_IN_QUEUE = 'not_in_queue'
 
 # Lua script for atomic unique enqueue: check existence, save job, push to queue
 UNIQUE_ENQUEUE_SCRIPT = """
@@ -265,7 +271,7 @@ def release_lock(connection, lock_key: str, owner_token: str) -> bool:
 
     Args:
         connection: Redis connection
-        lock_key (str): The Redis key for the lock
+        lock_key (str): The lock key
         owner_token (str): Token identifying the lock owner
 
     Returns:
@@ -274,3 +280,108 @@ def release_lock(connection, lock_key: str, owner_token: str) -> bool:
     """
     script = connection.register_script(RELEASE_LOCK_SCRIPT)
     return bool(script(keys=[lock_key], args=[owner_token]))
+
+
+# Lua script for atomically moving waiting jobs from one queue to another.
+TRANSFER_JOBS_SCRIPT = """
+    -- KEYS[1] = source queue key (rq:queue:{source})
+    -- KEYS[2] = destination queue key (rq:queue:{destination})
+    -- KEYS[3] = all-queues set key (rq:queues)
+    -- ARGV[1] = job hash namespace prefix (e.g. "rq:job:")
+    -- ARGV[2] = destination queue name (the jobs' new origin)
+    -- ARGV[3...] = job ids requested for transfer
+    --
+    -- Returns an array of status strings, one per requested id (request order):
+    --   "moved"        - job was waiting in source and is now in destination
+    --   "no_such_job"  - no job hash exists for the id (unknown job)
+    --   "not_in_queue" - job exists, but is no longer waiting in source
+    --                    (e.g. taken by a worker, canceled, or in another queue)
+
+    local source = KEYS[1]
+    local destination = KEYS[2]
+    local prefix = ARGV[1]
+    local destination_name = ARGV[2]
+
+    local queue_job_ids = redis.call("LRANGE", source, 0, -1)
+    local in_source = {}
+    for _, id in ipairs(queue_job_ids) do
+        in_source[id] = true
+    end
+
+    local requested = {}
+    local statuses = {}
+    for i = 3, #ARGV do
+        local id = ARGV[i]
+        requested[id] = true
+        local status
+        if redis.call("EXISTS", prefix .. id) == 0 then
+            status = "no_such_job"
+        elseif in_source[id] then
+            status = "moved"
+        else
+            status = "not_in_queue"
+        end
+        statuses[#statuses + 1] = status
+    end
+
+    if source ~= destination then
+        -- Walk source head-to-tail so transferred jobs keep their source-relative
+        -- order; RPUSH appends them behind the destination's existing jobs.
+        for _, id in ipairs(queue_job_ids) do
+            if requested[id] and redis.call("EXISTS", prefix .. id) == 1 then
+                -- count 0: remove every (possibly duplicated) occurrence, so the
+                -- same id can never remain in both queues.
+                redis.call("LREM", source, 0, id)
+                redis.call("HSET", prefix .. id, "origin", destination_name)
+                redis.call("RPUSH", destination, id)
+            end
+        end
+        redis.call("SADD", KEYS[3], destination)
+    end
+
+    return statuses
+"""
+
+_registered_transfer_scripts: dict[Any, Any] = {}
+
+
+def get_transfer_jobs_script(connection):
+    """Get or create the registered Lua script for queue-to-queue transfers."""
+    if connection not in _registered_transfer_scripts:
+        _registered_transfer_scripts[connection] = connection.register_script(TRANSFER_JOBS_SCRIPT)
+    return _registered_transfer_scripts[connection]
+
+
+def transfer_jobs(
+    connection,
+    source_key: str,
+    destination_key: str,
+    job_key_prefix: str,
+    destination_name: str,
+    job_ids: list[str],
+) -> list[str]:
+    """Atomically move waiting jobs from source queue to destination queue.
+
+    Jobs that exist and are still waiting in source are removed from source and
+    appended to destination in their source-relative order, with each job's
+    `origin` field updated. Unknown ids (missing job hash) and ids no longer
+    waiting in source are reported per job and left untouched.
+
+    Args:
+        connection: Redis connection
+        source_key: Redis key of the source queue
+        destination_key: Redis key of the destination queue
+        job_key_prefix: Namespace prefix for job hash keys (e.g. "rq:job:")
+        destination_name: Name of the destination queue (new `origin` value)
+        job_ids: Job ids requested for transfer
+
+    Returns:
+        Status strings (`moved`, `no_such_job` or `not_in_queue`), one per
+        requested id in request order.
+    """
+    script = get_transfer_jobs_script(connection)
+    result = script(
+        keys=[source_key, destination_key, 'rq:queues'],
+        args=[job_key_prefix, destination_name, *job_ids],
+    )
+    return [as_text(status) for status in result]

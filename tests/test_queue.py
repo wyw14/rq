@@ -1,6 +1,11 @@
 import json
+import random
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+
+from redis import Redis
 
 from rq import Queue, Retry
 from rq.exceptions import DuplicateJobError
@@ -14,6 +19,7 @@ from rq.registry import (
     StartedJobRegistry,
 )
 from rq.serializers import JSONSerializer
+from rq.utils import as_text
 from rq.worker import Worker
 from tests import RQTestCase, min_redis_version
 from tests.fixtures import echo, say_hello
@@ -946,3 +952,184 @@ class TestJobScheduling(RQTestCase):
         registry = ScheduledJobRegistry(queue=queue)
         self.assertIn(job, registry)
         self.assertEqual(registry.get_expiration_time(job), scheduled_time.replace(microsecond=0))
+
+
+class TestTransferJobs(RQTestCase):
+    def setUp(self):
+        super().setUp()
+        self.source = Queue('source', connection=self.connection)
+        self.destination = Queue('destination', connection=self.connection)
+        self.jobs = [self.source.enqueue(say_hello) for _ in range(4)]
+        self.ids = [job.id for job in self.jobs]
+        self.preexisting = [self.destination.enqueue(say_hello) for _ in range(2)]
+        self.preexisting_ids = [job.id for job in self.preexisting]
+
+    def test_transfer_moves_only_requested_jobs(self):
+        """Requested waiting jobs move; all other jobs stay in place."""
+        result = self.source.transfer_jobs([self.ids[1], self.ids[3]], self.destination)
+        self.assertEqual(result, {self.ids[1]: 'moved', self.ids[3]: 'moved'})
+        self.assertEqual(self.source.job_ids, [self.ids[0], self.ids[2]])
+        self.assertEqual(
+            self.destination.job_ids,
+            self.preexisting_ids + [self.ids[1], self.ids[3]],
+        )
+
+    def test_transfer_appends_in_source_order_regardless_of_request_order(self):
+        """Moved jobs keep source-relative order and go behind existing jobs."""
+        self.source.transfer_jobs([self.ids[3], self.ids[0], self.ids[1]], self.destination)
+        self.assertEqual(self.source.job_ids, [self.ids[2]])
+        self.assertEqual(
+            self.destination.job_ids,
+            self.preexisting_ids + [self.ids[0], self.ids[1], self.ids[3]],
+        )
+
+    def test_transfer_updates_job_origin(self):
+        """Moved jobs record the destination as their new origin."""
+        self.source.transfer_jobs([self.ids[1]], self.destination)
+        self.assertEqual(Job.fetch(self.ids[1], connection=self.connection).origin, 'destination')
+        self.assertEqual(Job.fetch(self.ids[0], connection=self.connection).origin, 'source')
+
+    def test_transfer_accepts_job_instances_and_destination_name(self):
+        """Job instances can be passed; destination may be given by name."""
+        result = self.source.transfer_jobs([self.jobs[0]], 'destination')
+        self.assertEqual(result, {self.ids[0]: 'moved'})
+        self.assertEqual(self.destination.job_ids, self.preexisting_ids + [self.ids[0]])
+
+    def test_transfer_unknown_job(self):
+        """Unknown ids (no job hash) report no_such_job and change nothing."""
+        result = self.source.transfer_jobs(['nonexistent-id'], self.destination)
+        self.assertEqual(result, {'nonexistent-id': 'no_such_job'})
+        self.assertEqual(self.source.job_ids, self.ids)
+        self.assertEqual(self.destination.job_ids, self.preexisting_ids)
+
+    def test_transfer_job_in_other_queue(self):
+        """Jobs in another queue report not_in_queue and stay untouched."""
+        other = Queue('other', connection=self.connection)
+        other_job = other.enqueue(say_hello)
+        result = self.source.transfer_jobs([other_job.id], self.destination)
+        self.assertEqual(result, {other_job.id: 'not_in_queue'})
+        self.assertEqual(other.job_ids, [other_job.id])
+        self.assertEqual(self.destination.job_ids, self.preexisting_ids)
+
+    def test_transfer_job_taken_via_intermediate_queue(self):
+        """Jobs moved to the intermediate queue by a worker are not put back."""
+        taken_id = self.ids[0]
+        self.connection.lmove(self.source.key, self.source.intermediate_queue_key)
+        result = self.source.transfer_jobs([taken_id], self.destination)
+        self.assertEqual(result, {taken_id: 'not_in_queue'})
+        self.assertNotIn(taken_id, self.source.job_ids)
+        self.assertNotIn(taken_id, self.destination.job_ids)
+        self.assertEqual(
+            [as_text(raw) for raw in self.connection.lrange(self.source.intermediate_queue_key, 0, -1)],
+            [taken_id],
+        )
+
+    def test_transfer_job_taken_via_lpop(self):
+        """Jobs popped directly (legacy path) report not_in_queue."""
+        self.connection.lpop(self.source.key)
+        result = self.source.transfer_jobs([self.ids[0]], self.destination)
+        self.assertEqual(result, {self.ids[0]: 'not_in_queue'})
+        self.assertNotIn(self.ids[0], self.destination.job_ids)
+
+    def test_transfer_reports_mixed_results(self):
+        """Unknown, taken and waiting ids are distinguished in one call."""
+        taken_id = self.ids[0]
+        waiting_id = self.ids[1]
+        self.connection.lmove(self.source.key, self.source.intermediate_queue_key)
+        result = self.source.transfer_jobs(['nonexistent-id', taken_id, waiting_id], self.destination)
+        self.assertEqual(
+            result,
+            {
+                'nonexistent-id': 'no_such_job',
+                taken_id: 'not_in_queue',
+                waiting_id: 'moved',
+            },
+        )
+        self.assertEqual(self.destination.job_ids, self.preexisting_ids + [waiting_id])
+
+    def test_transfer_to_same_queue_raises(self):
+        """Transferring a queue's jobs to itself is rejected."""
+        with self.assertRaises(ValueError):
+            self.source.transfer_jobs([self.ids[0]], self.source)
+
+    def test_transfer_across_connections_raises(self):
+        """Source and destination must share a Redis connection."""
+        other_destination = Queue('destination', connection=Redis(db=15))
+        with self.assertRaises(ValueError):
+            self.source.transfer_jobs([self.ids[0]], other_destination)
+
+    def test_transfer_concurrent_with_workers(self):
+        """All transfer rules hold while workers continuously take jobs."""
+        # Use dedicated queues so this test doesn't pick up setUp's jobs.
+        source = Queue('concurrent-source', connection=self.connection)
+        destination = Queue('concurrent-destination', connection=self.connection)
+
+        num_jobs = 120
+        jobs = [source.enqueue(say_hello) for _ in range(num_jobs)]
+        ids = [job.id for job in jobs]
+        position = {job_id: i for i, job_id in enumerate(ids)}
+        preexisting = [destination.enqueue(say_hello) for _ in range(3)]
+        preexisting_ids = [job.id for job in preexisting]
+
+        stop = threading.Event()
+
+        def consume():
+            while not stop.is_set():
+                result = self.connection.lmove(source.key, source.intermediate_queue_key)
+                if result is None:
+                    time.sleep(0.001)
+
+        worker_threads = [threading.Thread(target=consume) for _ in range(4)]
+        for thread in worker_threads:
+            thread.start()
+
+        # Transfer disjoint batches in random execution/request order.
+        batches = [ids[i::6] for i in range(6)]
+        random.shuffle(batches)
+        moved_by_call: list[list[str]] = []
+        for batch in batches:
+            requested = batch[:]
+            random.shuffle(requested)
+            result = source.transfer_jobs(requested, destination)
+            moved_by_call.append([job_id for job_id in requested if result[job_id] == 'moved'])
+            time.sleep(0.002)
+
+        stop.set()
+        for thread in worker_threads:
+            thread.join(timeout=5)
+        self.assertFalse(any(thread.is_alive() for thread in worker_threads))
+
+        source_ids = source.job_ids
+        destination_ids = destination.job_ids
+        intermediate_ids = [
+            as_text(raw)
+            for raw in self.connection.lrange(source.intermediate_queue_key, 0, -1)
+        ]
+
+        # No id exists in two locations, and every id is accounted for once.
+        self.assertEqual(len(set(source_ids)), len(source_ids))
+        self.assertEqual(len(set(destination_ids)), len(destination_ids))
+        self.assertEqual(len(set(intermediate_ids)), len(intermediate_ids))
+        self.assertFalse(set(source_ids) & set(destination_ids))
+        self.assertFalse(set(source_ids) & set(intermediate_ids))
+        self.assertFalse(set(destination_ids) & set(intermediate_ids))
+        self.assertEqual(
+            sorted(source_ids + destination_ids[len(preexisting_ids):] + intermediate_ids),
+            sorted(ids),
+        )
+
+        # Destination keeps preexisting jobs first; each moved batch is appended
+        # in source order, batches in execution order.
+        expected_order = preexisting_ids[:]
+        for moved in moved_by_call:
+            expected_order.extend(sorted(moved, key=lambda job_id: position[job_id]))
+        self.assertEqual(destination_ids, expected_order)
+
+        # Jobs taken by workers never returned to a waiting queue.
+        self.assertFalse(set(intermediate_ids) & set(source_ids + destination_ids))
+
+        # origin reflects each job's final queue.
+        for job_id in destination_ids:
+            self.assertEqual(Job.fetch(job_id, connection=self.connection).origin, 'concurrent-destination')
+        for job_id in intermediate_ids:
+            self.assertEqual(Job.fetch(job_id, connection=self.connection).origin, 'concurrent-source')

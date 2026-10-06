@@ -1,4 +1,5 @@
 ### RQ 3.0 (unreleased)
+* Added `Queue.transfer_jobs()` to atomically move waiting jobs to another queue, preserving order and reporting per-job results (`moved`, `no_such_job`, `not_in_queue`). Thanks @selwin!
 * `Job.perform()` no longer removes the job key's TTL. Job key TTL changes are now handled by workers. Thanks @selwin!
 * Refactored how job dependencies are handled. Introduced `READY_TO_ENQUEUE` job status and ReadyJobRegistry. Thanks @selwin!
 * `get_current_job()` now uses `contextvars` instead of thread-locals; gevent-based custom workers need `greenlet` >= 0.4.17. Thanks @selwin!
