@@ -1,5 +1,6 @@
 # ruff: noqa: F401
 from .callbacks import Callback
+from .dependency_graph import export_dependency_graph
 from .job import Retry, cancel_job, get_current_job, requeue_job
 from .queue import Queue
 from .rate_limit import RateLimit
@@ -12,6 +13,7 @@ __all__ = [
     'Callback',
     'Retry',
     'cancel_job',
+    'export_dependency_graph',
     'get_current_job',
     'requeue_job',
     'Queue',

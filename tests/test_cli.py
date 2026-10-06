@@ -822,6 +822,30 @@ class TestRQCli(CLITestCase):
         job = Job.fetch(id, connection=self.connection)
         self.assertEqual((job.args, job.kwargs), ([], {'key': json.loads(open('tests/test.json').read())}))
 
+    def test_dependency_graph(self):
+        """rq dependency-graph -u <url> JOB_ID"""
+        queue = Queue(connection=self.connection)
+        queue.enqueue(say_hello, job_id='parent-job')
+        queue.enqueue(say_hello, job_id='child-job', depends_on='parent-job')
+
+        runner = CliRunner()
+        result = runner.invoke(
+            main,
+            ['dependency-graph', '-u', self.redis_url, 'child-job', '--depth', '2'],
+        )
+        self.assert_normal_execution(result)
+        graph = json.loads(result.output)
+        self.assertEqual(graph['roots'], ['child-job'])
+        self.assertIn('parent-job', graph['nodes'])
+        self.assertEqual(graph['edges'], [{'source': 'child-job', 'target': 'parent-job'}])
+        self.assertFalse(graph['atomic_snapshot'])
+
+    def test_dependency_graph_requires_job_ids(self):
+        """rq dependency-graph without job ids exits with an error"""
+        runner = CliRunner()
+        result = runner.invoke(main, ['dependency-graph', '-u', self.redis_url])
+        self.assertEqual(result.exit_code, 1)
+
 
 class WorkerPoolCLITestCase(CLITestCase):
     def test_config_file_logging(self):

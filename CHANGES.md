@@ -1,4 +1,5 @@
 ### RQ 3.0 (unreleased)
+* Added `export_dependency_graph()` and the `rq dependency-graph` command to export a job's dependency graph with observed node states for offline diagnosis. Exports preserve missing, unreadable and truncated nodes, report their observation time window and never include job arguments or results by default.
 * `Job.perform()` no longer removes the job key's TTL. Job key TTL changes are now handled by workers. Thanks @selwin!
 * Refactored how job dependencies are handled. Introduced `READY_TO_ENQUEUE` job status and ReadyJobRegistry. Thanks @selwin!
 * `get_current_job()` now uses `contextvars` instead of thread-locals; gevent-based custom workers need `greenlet` >= 0.4.17. Thanks @selwin!

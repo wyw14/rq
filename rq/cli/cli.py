@@ -2,6 +2,7 @@
 RQ command line tool
 """
 
+import json
 import sys
 
 import click
@@ -264,6 +265,64 @@ def enqueue(
 
     if not quiet:
         click.echo(f"Enqueued {blue(function_string)} with job-id '{job.id}'.")
+
+
+@main.command('dependency-graph')
+@click.argument('job_ids', nargs=-1)
+@click.option(
+    '--direction',
+    type=click.Choice(['upstream', 'downstream', 'both']),
+    default='upstream',
+    show_default=True,
+    help="upstream: jobs the given jobs wait on; downstream: jobs waiting on them; both",
+)
+@click.option(
+    '--depth',
+    'max_depth',
+    type=int,
+    default=3,
+    show_default=True,
+    help='Maximum dependency distance from the given jobs. Use -1 for unlimited.',
+)
+@click.option(
+    '--max-nodes',
+    type=int,
+    default=1000,
+    show_default=True,
+    help='Maximum number of job records to read. Use -1 for unlimited.',
+)
+@click.option('--output', '-o', type=click.Path(dir_okay=False), default=None,
+              help='Write the JSON export to this file instead of stdout.')
+@pass_cli_config
+def dependency_graph(cli_config, job_ids, direction, max_depth, max_nodes, output, serializer, **options):
+    """Export job dependencies and observed states as JSON for offline diagnosis."""
+    if not job_ids:
+        click.echo('At least one job id is required')
+        sys.exit(1)
+
+    from rq.dependency_graph import export_dependency_graph
+
+    depth = None if max_depth < 0 else max_depth
+    node_limit = None if max_nodes < 0 else max_nodes
+
+    graph = export_dependency_graph(
+        job_ids,
+        connection=cli_config.connection,
+        direction=direction,
+        max_depth=depth,
+        max_nodes=node_limit,
+        serializer=serializer,
+    )
+    payload = json.dumps(graph, indent=2)
+
+    if output:
+        with open(output, 'w', encoding='utf-8') as file_obj:
+            file_obj.write(payload)
+        click.echo(
+            f"Exported {graph['counts']['nodes']} nodes and {graph['counts']['edges']} edges to {output}"
+        )
+    else:
+        click.echo(payload)
 
 
 if __name__ == '__main__':
