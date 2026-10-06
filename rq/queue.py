@@ -23,11 +23,12 @@ if TYPE_CHECKING:
     from redis import Redis
     from redis.client import Pipeline
 
+    from .dependency import PrecheckResult
     from .job import Retry
 
 from .callbacks import Callback, execute_failure_callback, execute_success_callback
 from .defaults import DEFAULT_RESULT_TTL
-from .dependency import Dependency
+from .dependency import DEFAULT_PRECHECK_LIMIT, Dependency, precheck_dependencies
 from .exceptions import DequeueTimeout, NoSuchJobError
 from .intermediate_queue import IntermediateQueue
 from .job import Job, JobStatus
@@ -957,6 +958,27 @@ class Queue:
                 pipe.execute()
 
         return jobs_without_dependencies + jobs_with_unmet_dependencies + jobs_with_met_dependencies
+
+    def precheck(
+        self, jobs: Sequence[Job], max_checks: int | None = DEFAULT_PRECHECK_LIMIT
+    ) -> 'PrecheckResult':
+        """Performs a read-only precheck of a batch's dependency graph; nothing is enqueued.
+
+        Delegates to `precheck_dependencies`; see that function for how cycles, missing
+        dependencies, failed/canceled/stopped dependencies and per-job failure allowance are
+        interpreted, and how dependency paths locate problems. Findings describe the state at
+        read time and are not guaranteed to hold at enqueue time. When ``max_checks`` is
+        reached, uncovered jobs are reported explicitly.
+
+        Args:
+            jobs (Sequence[Job]): The batch of jobs to check.
+            max_checks (Optional[int]): Maximum number of jobs whose relations are expanded.
+                Pass None to disable the limit. Defaults to DEFAULT_PRECHECK_LIMIT.
+
+        Returns:
+            PrecheckResult: Per-job classifications and coverage information.
+        """
+        return precheck_dependencies(jobs, max_checks=max_checks)
 
     def run_job(self, job: Job) -> Job:
         """Run the job
