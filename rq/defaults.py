@@ -55,6 +55,15 @@ Defaults to 1 YEAR in seconds
 """
 
 
+DEFAULT_GROUP_SETTLEMENT_TTL = 31536000
+""" The Time To Live (TTL) in seconds to keep a group's settlement records.
+Independent from `DEFAULT_RESULT_TTL` and `DEFAULT_FAILURE_TTL`; only applies
+when a group is explicitly created with settlement records enabled.
+Refreshed on every settlement write, so records expire this long after the
+last member update. Defaults to 1 YEAR in seconds.
+"""
+
+
 DEFAULT_CRON_JOB_HISTORY_LIMIT = 1000
 """ The maximum number of spawned job IDs to keep in a cron job's history
 """

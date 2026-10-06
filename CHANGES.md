@@ -1,4 +1,5 @@
 ### RQ 3.0 (unreleased)
+* Added optional group settlement records. `Group.create(..., settlement_ttl=...)` keeps a compact per-member terminal-state summary (successful/failed/canceled, attempt and execution ID) with its own retention period, independent of `result_ttl`/`failure_ttl`; members whose jobs expire before settlement are reported as unknown instead of disappearing, and retries never double-count a member.
 * `Job.perform()` no longer removes the job key's TTL. Job key TTL changes are now handled by workers. Thanks @selwin!
 * Refactored how job dependencies are handled. Introduced `READY_TO_ENQUEUE` job status and ReadyJobRegistry. Thanks @selwin!
 * `get_current_job()` now uses `contextvars` instead of thread-locals; gevent-based custom workers need `greenlet` >= 0.4.17. Thanks @selwin!

@@ -43,7 +43,7 @@ from ..defaults import (
 )
 from ..exceptions import DequeueTimeout, DeserializationError, StopRequested
 from ..executions import WORKER_EXECUTIONS_KEY_TEMPLATE, Execution, cleanup_execution, prepare_execution
-from ..group import Group
+from ..group import Group, GroupSettlement, SettlementStatus
 from ..job import Job, JobStatus, Retry
 from ..job_lifecycle import call_exception_handlers, format_exc_info
 from ..logutils import blue, green, setup_loghandlers
@@ -1432,6 +1432,14 @@ class BaseWorker:
                     execution_id=execution_id,
                     execution_started_at=execution_started_at,
                     execution_ended_at=execution_ended_at,
+                )
+
+                GroupSettlement.record(
+                    job,
+                    SettlementStatus.FAILED,
+                    pipeline=pipeline,
+                    execution_id=execution_id,
+                    ended_at=execution_ended_at,
                 )
 
                 self.increment_failed_job_count(pipeline=pipeline)

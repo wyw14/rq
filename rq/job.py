@@ -1266,6 +1266,10 @@ class Job:
 
                 self.set_status(JobStatus.CANCELED, pipeline=pipe)
 
+                from .group import GroupSettlement, SettlementStatus
+
+                GroupSettlement.record(self, SettlementStatus.CANCELED, pipeline=pipe)
+
                 if remove_from_dependencies:
                     # Go through all dependencies and remove the current job from each dependency's dependents_key
                     for dependency in self.fetch_dependencies(pipeline=pipe):
@@ -1318,7 +1322,13 @@ class Job:
         Returns:
             job (Job): The requeued Job instance
         """
-        return self.failed_job_registry.requeue(self, at_front=at_front)
+        job = self.failed_job_registry.requeue(self, at_front=at_front)
+        from .group import GroupSettlement
+
+        # A manual requeue is another attempt at a terminal result; keep the
+        # settlement entry pending and attribute the next run to a new attempt.
+        GroupSettlement.mark_retry(job)
+        return job
 
     @property
     def execution_registry(self) -> ExecutionRegistry:
@@ -1642,6 +1652,16 @@ class Job:
             execution_ended_at=execution_ended_at,
         )
 
+        from .group import GroupSettlement, SettlementStatus
+
+        GroupSettlement.record(
+            self,
+            SettlementStatus.SUCCESSFUL,
+            pipeline=pipeline,
+            execution_id=execution_id,
+            ended_at=execution_ended_at,
+        )
+
         if result_ttl != 0:
             finished_job_registry = self.finished_job_registry
             finished_job_registry.add(self, result_ttl, pipeline)
@@ -1677,6 +1697,18 @@ class Job:
             execution_id=execution_id,
             execution_started_at=execution_started_at,
             execution_ended_at=execution_ended_at,
+        )
+
+        from .group import GroupSettlement, SettlementStatus
+
+        # STOPPED jobs also go through this handler; for settlement they are
+        # counted as failed.
+        GroupSettlement.record(
+            self,
+            SettlementStatus.FAILED,
+            pipeline=pipeline,
+            execution_id=execution_id,
+            ended_at=execution_ended_at,
         )
 
     def _handle_retry_result(
@@ -1718,6 +1750,11 @@ class Job:
         )
         retry_interval = Retry.get_interval(self.number_of_retries or 0, retry.intervals)
         self.number_of_retries = 1 if not self.number_of_retries else self.number_of_retries + 1
+        from .group import GroupSettlement
+
+        # The member is re-executed, but still has no terminal state: bump the
+        # attempt ordinal so its eventual terminal state is attributed correctly.
+        GroupSettlement.mark_retry(self, pipeline=pipeline)
         if retry_interval:
             scheduled_datetime = now() + timedelta(seconds=retry_interval)
             self.set_status(JobStatus.SCHEDULED)
@@ -1770,6 +1807,13 @@ class Job:
         retry_interval = self.get_retry_interval()
         assert self.retries_left
         self.retries_left = self.retries_left - 1
+
+        from .group import GroupSettlement
+
+        # Re-execution pending: advance the settlement attempt ordinal without
+        # recording a terminal state (no-op unless group settlement is enabled).
+        GroupSettlement.mark_retry(self, pipeline=pipeline)
+
         if retry_interval:
             scheduled_datetime = now() + timedelta(seconds=retry_interval)
             self.set_status(JobStatus.SCHEDULED)
